@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Скачивание трека Яндекс Музыки по полной ссылке (Python 3.9+)."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 from urllib.parse import urlparse
 
 
 def track_id(url):
+    url = url.strip()
+    # При копировании из чата ссылка может иметь вид [текст](URL).
+    markdown = re.fullmatch(r'\[.*\]\((https?://.*)\)', url, flags=re.DOTALL)
+    if markdown:
+        url = markdown.group(1)
+    # Терминал и редакторы иногда экранируют ?, &, = обратным слешем.
+    url = re.sub(r'\\+([?&=/#])', r'\1', url)
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https') or parsed.hostname not in {
         'music.yandex.ru', 'music.yandex.com', 'music.yandex.by',
@@ -27,6 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('url', help='Полная ссылка на трек')
     parser.add_argument('-o', '--output', default='music', help='Папка назначения')
+    parser.add_argument('--login', action='store_true', help='Войти заново и сохранить новый аккаунт')
     args = parser.parse_args()
     identifier = track_id(args.url)
     try:
@@ -34,13 +44,36 @@ def main():
     except ImportError:
         raise RuntimeError('Установите библиотеку: python3 -m pip install -U yandex-music')
 
-    token = os.environ.get('YANDEX_MUSIC_TOKEN')
+    token_file = Path(__file__).resolve().parent / '.yandex_music_token.json'
+    token = None if args.login else os.environ.get('YANDEX_MUSIC_TOKEN')
+    if not token and not args.login and token_file.exists():
+        try:
+            saved = json.loads(token_file.read_text(encoding='utf-8'))
+            if saved.get('expires_at', 0) > time.time() + 60:
+                token = saved.get('access_token')
+        except (ValueError, AttributeError):
+            print('Сохранённая авторизация повреждена. Войдите заново.')
     client = Client(token) if token else Client()
     if not token:
         def on_code(code):
             print(f'Откройте {code.verification_url} и введите код: {code.user_code}', flush=True)
-        client.device_auth(on_code=on_code)
-    client.init()
+        credentials = client.device_auth(on_code=on_code)
+        client.init()
+        saved = {
+            'access_token': credentials.access_token,
+            'expires_at': time.time() + float(credentials.expires_in or 0),
+        }
+        fd, temporary_token = tempfile.mkstemp(prefix='.yandex-token-', dir=token_file.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(saved, stream)
+            os.replace(temporary_token, token_file)
+        finally:
+            Path(temporary_token).unlink(missing_ok=True)
+        print('Авторизация сохранена для следующих запусков.')
+    else:
+        client.init()
     tracks = client.tracks([identifier])
     if not tracks:
         raise RuntimeError('Трек не найден.')
@@ -81,5 +114,5 @@ if __name__ == '__main__':
         if isinstance(error, (ValueError, RuntimeError)):
             print(f'Ошибка: {error}', file=sys.stderr)
         else:
-            print(f'Ошибка: {type(error).__name__}. Проверьте сеть, авторизацию и доступность трека.', file=sys.stderr)
+            print(f'Ошибка: {type(error).__name__}. Проверьте сеть и доступность трека. Для повторного входа добавьте --login.', file=sys.stderr)
         sys.exit(1)
